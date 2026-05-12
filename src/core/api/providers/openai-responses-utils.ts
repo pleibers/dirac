@@ -5,6 +5,7 @@ import { calculateApiCostOpenAI } from "@utils/cost"
 import { normalizeOpenaiReasoningEffort } from "@shared/storage/types"
 import { buildExternalBasicHeaders } from "@/services/EnvUtils"
 import { ChatCompletionReasoningEffort, ChatCompletionTool } from "openai/resources/chat/completions"
+import { getStreamingArgumentDelta } from "../transform/tool-call-processor"
 
 export interface ResponsesWebsocketOptions {
 	apiKey: string
@@ -21,17 +22,11 @@ export async function* yieldUsage(info: ModelInfo, usage: any, id?: string): Asy
 	const cacheWriteTokens = 0
 	const reasoningTokens = usage.output_tokens_details?.reasoning_tokens || 0
 	const totalTokens = usage.total_tokens || 0
-		
-	const totalCost = calculateApiCostOpenAI(
-		info,
-		inputTokens,
-		outputTokens + reasoningTokens,
-		cacheWriteTokens,
-		cacheReadTokens,
-	)
-	
+
+	const totalCost = calculateApiCostOpenAI(info, inputTokens, outputTokens + reasoningTokens, cacheWriteTokens, cacheReadTokens)
+
 	const nonCachedInputTokens = Math.max(0, inputTokens - cacheReadTokens - cacheWriteTokens)
-	
+
 	yield {
 		type: "usage",
 		inputTokens: nonCachedInputTokens,
@@ -58,12 +53,12 @@ export function mapResponseTools(tools: ChatCompletionTool[], strict = false): O
 		if ((tool as any).type === "web_search") {
 			return {
 				type: "web_search" as any,
-				...(tool as any).search_context_size ? { search_context_size: (tool as any).search_context_size } : {},
-				...(tool as any).filters ? { filters: (tool as any).filters } : {},
-				...(tool as any).user_location ? { user_location: (tool as any).user_location } : {},
-				...(tool as any).external_web_access !== undefined
+				...((tool as any).search_context_size ? { search_context_size: (tool as any).search_context_size } : {}),
+				...((tool as any).filters ? { filters: (tool as any).filters } : {}),
+				...((tool as any).user_location ? { user_location: (tool as any).user_location } : {}),
+				...((tool as any).external_web_access !== undefined
 					? { external_web_access: (tool as any).external_web_access }
-					: {},
+					: {}),
 			}
 		}
 		return undefined
@@ -101,7 +96,6 @@ export function buildResponseCreateParams(args: {
 		...(reasoning ? { reasoning } : {}),
 	}
 }
-
 
 export async function* parseSseResponse(body: ReadableStream<Uint8Array>): AsyncIterable<any> {
 	const reader = body.getReader()
@@ -142,24 +136,29 @@ export async function* processResponsesEvents(
 	stream: AsyncIterable<OpenAI.Responses.ResponseStreamEvent>,
 	modelInfo: ModelInfo,
 ): AsyncGenerator<any> {
-	const functionCallByItemId = new Map<string, { call_id?: string; name?: string; id?: string }>()
+	const functionCallByItemId = new Map<string, { call_id?: string; name?: string; id?: string; arguments: string }>()
 
 	for await (const chunk of stream) {
 		if (chunk.type === "response.output_item.added") {
 			const item = chunk.item
 			if (item.type === "function_call" && item.id) {
-				functionCallByItemId.set(item.id, { call_id: item.call_id, name: item.name, id: item.id })
-				yield {
-					id: item.id,
-					type: "tool_calls",
-					tool_call: {
-						call_id: item.call_id,
-						function: {
-							id: item.id,
-							name: item.name,
-							arguments: item.arguments,
+				const functionCall = { call_id: item.call_id, name: item.name, id: item.id, arguments: "" }
+				functionCallByItemId.set(item.id, functionCall)
+				const normalized = getStreamingArgumentDelta(functionCall.arguments, item.arguments)
+				functionCall.arguments = normalized.accumulatedArguments
+				if (normalized.argumentDelta !== undefined) {
+					yield {
+						id: item.id,
+						type: "tool_calls",
+						tool_call: {
+							call_id: item.call_id,
+							function: {
+								id: item.id,
+								name: item.name,
+								arguments: normalized.argumentDelta,
+							},
 						},
-					},
+					}
 				}
 			}
 			if (item.type === "reasoning" && item.encrypted_content && item.id) {
@@ -183,20 +182,31 @@ export async function* processResponsesEvents(
 		if (chunk.type === "response.output_item.done") {
 			const item = chunk.item
 			if (item.type === "function_call") {
-				if (item.id) {
-					functionCallByItemId.set(item.id, { call_id: item.call_id, name: item.name, id: item.id })
+				let functionCall = item.id ? functionCallByItemId.get(item.id) : undefined
+				if (!functionCall) {
+					functionCall = { call_id: item.call_id, name: item.name, id: item.id, arguments: "" }
+					if (item.id) {
+						functionCallByItemId.set(item.id, functionCall)
+					}
 				}
-				yield {
-					type: "tool_calls",
-					id: item.id || item.call_id,
-					tool_call: {
-						call_id: item.call_id,
-						function: {
-							id: item.id,
-							name: item.name,
-							arguments: item.arguments,
+				functionCall.call_id = item.call_id
+				functionCall.name = item.name
+				functionCall.id = item.id
+				const normalized = getStreamingArgumentDelta(functionCall.arguments, item.arguments)
+				functionCall.arguments = normalized.accumulatedArguments
+				if (normalized.argumentDelta !== undefined) {
+					yield {
+						type: "tool_calls",
+						id: item.id || item.call_id,
+						tool_call: {
+							call_id: item.call_id,
+							function: {
+								id: item.id,
+								name: item.name,
+								arguments: normalized.argumentDelta,
+							},
 						},
-					},
+					}
 				}
 			}
 			if (item.type === "reasoning") {
@@ -249,30 +259,15 @@ export async function* processResponsesEvents(
 			}
 		}
 		if (chunk.type === "response.function_call_arguments.delta") {
-			const pendingCall = functionCallByItemId.get(chunk.item_id)
+			const pendingCall = functionCallByItemId.get(chunk.item_id) || { id: chunk.item_id, arguments: "" }
+			functionCallByItemId.set(chunk.item_id, pendingCall)
 			const callId = pendingCall?.call_id
 			const functionName = pendingCall?.name
 			const functionId = pendingCall?.id || chunk.item_id
+			const normalized = getStreamingArgumentDelta(pendingCall.arguments, chunk.delta)
+			pendingCall.arguments = normalized.accumulatedArguments
 
-			yield {
-				id: functionId,
-				type: "tool_calls",
-				tool_call: {
-					call_id: callId,
-					function: {
-						id: functionId,
-						name: functionName,
-						arguments: chunk.delta,
-					},
-				},
-			}
-		}
-		if (chunk.type === "response.function_call_arguments.done") {
-			if (chunk.item_id && chunk.name && chunk.arguments) {
-				const pendingCall = functionCallByItemId.get(chunk.item_id)
-				const callId = pendingCall?.call_id
-				const functionId = pendingCall?.id || chunk.item_id
-
+			if (normalized.argumentDelta !== undefined) {
 				yield {
 					id: functionId,
 					type: "tool_calls",
@@ -280,10 +275,35 @@ export async function* processResponsesEvents(
 						call_id: callId,
 						function: {
 							id: functionId,
-							name: chunk.name,
-							arguments: chunk.arguments,
+							name: functionName,
+							arguments: normalized.argumentDelta,
 						},
 					},
+				}
+			}
+		}
+		if (chunk.type === "response.function_call_arguments.done") {
+			if (chunk.item_id && chunk.name && chunk.arguments) {
+				const pendingCall = functionCallByItemId.get(chunk.item_id) || { id: chunk.item_id, arguments: "" }
+				functionCallByItemId.set(chunk.item_id, pendingCall)
+				const callId = pendingCall?.call_id
+				const functionId = pendingCall?.id || chunk.item_id
+				const normalized = getStreamingArgumentDelta(pendingCall.arguments, chunk.arguments)
+				pendingCall.arguments = normalized.accumulatedArguments
+
+				if (normalized.argumentDelta !== undefined) {
+					yield {
+						id: functionId,
+						type: "tool_calls",
+						tool_call: {
+							call_id: callId,
+							function: {
+								id: functionId,
+								name: chunk.name,
+								arguments: normalized.argumentDelta,
+							},
+						},
+					}
 				}
 			}
 		}

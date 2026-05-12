@@ -2,9 +2,39 @@ import type {
 	ChatCompletionChunk,
 	ChatCompletionToolChoiceOption,
 	ChatCompletionTool as OpenAITool,
-} from "openai/resources/chat/completions";
-import { Logger } from "@/shared/services/Logger";
-import type { ApiStreamToolCallsChunk } from "./stream";
+} from "openai/resources/chat/completions"
+import { Logger } from "@/shared/services/Logger"
+import type { ApiStreamToolCallsChunk } from "./stream"
+
+interface ToolCallState {
+	id: string
+	name: string
+	arguments: string
+}
+
+export function getStreamingArgumentDelta(
+	accumulatedArguments: string,
+	incomingArguments: unknown,
+): { accumulatedArguments: string; argumentDelta: string | undefined } {
+	if (incomingArguments === undefined) {
+		return { accumulatedArguments, argumentDelta: undefined }
+	}
+
+	const incomingArgumentDelta = typeof incomingArguments === "string" ? incomingArguments : JSON.stringify(incomingArguments)
+
+	if (incomingArgumentDelta.startsWith(accumulatedArguments)) {
+		const missingSuffix = incomingArgumentDelta.slice(accumulatedArguments.length)
+		return {
+			accumulatedArguments: incomingArgumentDelta,
+			argumentDelta: missingSuffix || undefined,
+		}
+	}
+
+	return {
+		accumulatedArguments: accumulatedArguments + incomingArgumentDelta,
+		argumentDelta: incomingArgumentDelta,
+	}
+}
 
 /**
  * Helper class to process tool call deltas from OpenAI-compatible streaming responses.
@@ -12,7 +42,7 @@ import type { ApiStreamToolCallsChunk } from "./stream";
  * and yields properly formatted tool call chunks when arguments are received.
  */
 export class ToolCallProcessor {
-	private toolCallStateByIndex: Map<number, { id: string; name: string }>
+	private toolCallStateByIndex: Map<number, ToolCallState>
 
 	constructor() {
 		this.toolCallStateByIndex = new Map()
@@ -53,41 +83,48 @@ export class ToolCallProcessor {
 
 			// Only yield when we have all required fields: id, name, and arguments
 			// Only yield when we have all required fields: id, name, and arguments (or web_search query)
-			const hasFunctionArgs = toolCallDelta.function?.arguments !== undefined
+			const normalizedArgumentDelta = this.normalizeArgumentDelta(toolCallState, toolCallDelta.function?.arguments)
+			const hasFunctionArgs = normalizedArgumentDelta !== undefined
 			const hasWebSearchQuery = (toolCallDelta as any).web_search?.query !== undefined
 
 			if (toolCallState.id && toolCallState.name && (hasFunctionArgs || hasWebSearchQuery)) {
 				yield {
 					type: "tool_calls",
-					tool_call:
-						(toolCallState.name === "web_search"
-							? {
-									call_id: toolCallState.id,
-									type: "web_search",
-									web_search: (toolCallDelta as any).web_search || { query: "" },
-							  }
-							: {
-									...toolCallDelta,
-									function: {
-										...toolCallDelta.function,
-										id: toolCallState.id,
-										name: toolCallState.name,
-									},
-							  }) as any,
+					tool_call: (toolCallState.name === "web_search"
+						? {
+								call_id: toolCallState.id,
+								type: "web_search",
+								web_search: (toolCallDelta as any).web_search || { query: "" },
+							}
+						: {
+								...toolCallDelta,
+								function: {
+									...toolCallDelta.function,
+									id: toolCallState.id,
+									name: toolCallState.name,
+									arguments: normalizedArgumentDelta,
+								},
+							}) as any,
 				}
 			}
 		}
 	}
 
-	private getOrCreateToolCallState(index: number): { id: string; name: string } {
+	private getOrCreateToolCallState(index: number): ToolCallState {
 		const existingState = this.toolCallStateByIndex.get(index)
 		if (existingState) {
 			return existingState
 		}
 
-		const initialState = { id: "", name: "" }
+		const initialState = { id: "", name: "", arguments: "" }
 		this.toolCallStateByIndex.set(index, initialState)
 		return initialState
+	}
+
+	private normalizeArgumentDelta(toolCallState: ToolCallState, incomingArguments: unknown): string | undefined {
+		const normalized = getStreamingArgumentDelta(toolCallState.arguments, incomingArguments)
+		toolCallState.arguments = normalized.accumulatedArguments
+		return normalized.argumentDelta
 	}
 
 	/**
@@ -100,7 +137,7 @@ export class ToolCallProcessor {
 	/**
 	 * Get the current accumulated tool call state (useful for debugging).
 	 */
-	getState(): Record<number, { id: string; name: string }> {
+	getState(): Record<number, ToolCallState> {
 		return Object.fromEntries(this.toolCallStateByIndex.entries())
 	}
 }
@@ -132,7 +169,6 @@ export function getOpenAIToolParams(tools?: OpenAITool[], enableParallelToolCall
 
 	// Cast to any to support web_search tool type which is not yet in the official OpenAI SDK types
 	const finalTools = mappedTools as any[]
-
 
 	return {
 		tools: finalTools,

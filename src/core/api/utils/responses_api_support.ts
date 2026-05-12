@@ -1,6 +1,7 @@
 import OpenAI from "openai"
 import { ModelInfo } from "@/shared/api"
 import { Logger } from "@/shared/services/Logger"
+import { getStreamingArgumentDelta } from "../transform/tool-call-processor"
 
 // Type that represents the OpenAI ResponseStream with its private properties
 // The #private property issue can be resolved by using the AsyncIterable interface
@@ -15,24 +16,30 @@ export async function* handleResponsesApiStreamResponse(
 		cacheReadTokens: number,
 	) => Promise<number>,
 ) {
+	const argumentsByItemId = new Map<string, string>()
+
 	// Process the response stream
 	for await (const chunk of stream) {
 		// Handle different event types from Responses API
 		if (chunk.type === "response.output_item.added") {
 			const item = chunk.item
 			if (item.type === "function_call" && item.id) {
-				yield {
-					type: "tool_calls",
-					id: item.id,
-					tool_call: {
-						call_id: item.call_id,
-						function: {
-							id: item.id,
-							name: item.name,
-							arguments: item.arguments,
+				const normalized = getStreamingArgumentDelta(argumentsByItemId.get(item.id) || "", item.arguments)
+				argumentsByItemId.set(item.id, normalized.accumulatedArguments)
+				if (normalized.argumentDelta !== undefined) {
+					yield {
+						type: "tool_calls",
+						id: item.id,
+						tool_call: {
+							call_id: item.call_id,
+							function: {
+								id: item.id,
+								name: item.name,
+								arguments: normalized.argumentDelta,
+							},
 						},
-					},
-				} as const
+					} as const
+				}
 			}
 			if (item.type === "reasoning" && item.encrypted_content && item.id) {
 				yield {
@@ -46,18 +53,23 @@ export async function* handleResponsesApiStreamResponse(
 		if (chunk.type === "response.output_item.done") {
 			const item = chunk.item
 			if (item.type === "function_call") {
-				yield {
-					type: "tool_calls",
-					id: item.id || item.call_id,
-					tool_call: {
-						call_id: item.call_id,
-						function: {
-							id: item.id,
-							name: item.name,
-							arguments: item.arguments,
+				const itemId = item.id || item.call_id
+				const normalized = getStreamingArgumentDelta(argumentsByItemId.get(itemId) || "", item.arguments)
+				argumentsByItemId.set(itemId, normalized.accumulatedArguments)
+				if (normalized.argumentDelta !== undefined) {
+					yield {
+						type: "tool_calls",
+						id: itemId,
+						tool_call: {
+							call_id: item.call_id,
+							function: {
+								id: item.id,
+								name: item.name,
+								arguments: normalized.argumentDelta,
+							},
 						},
-					},
-				} as const
+					} as const
+				}
 			}
 			if (item.type === "reasoning") {
 				yield {
@@ -111,30 +123,38 @@ export async function* handleResponsesApiStreamResponse(
 			}
 		}
 		if (chunk.type === "response.function_call_arguments.delta") {
-			yield {
-				type: "tool_calls",
-				tool_call: {
-					function: {
-						id: chunk.item_id,
-						name: chunk.item_id,
-						arguments: chunk.delta,
-					},
-				},
-			} as const
-		}
-		if (chunk.type === "response.function_call_arguments.done") {
-			// Handle completed function call
-			if (chunk.item_id && chunk.name && chunk.arguments) {
+			const normalized = getStreamingArgumentDelta(argumentsByItemId.get(chunk.item_id) || "", chunk.delta)
+			argumentsByItemId.set(chunk.item_id, normalized.accumulatedArguments)
+			if (normalized.argumentDelta !== undefined) {
 				yield {
 					type: "tool_calls",
 					tool_call: {
 						function: {
 							id: chunk.item_id,
-							name: chunk.name,
-							arguments: chunk.arguments,
+							name: chunk.item_id,
+							arguments: normalized.argumentDelta,
 						},
 					},
 				} as const
+			}
+		}
+		if (chunk.type === "response.function_call_arguments.done") {
+			// Handle completed function call
+			if (chunk.item_id && chunk.name && chunk.arguments) {
+				const normalized = getStreamingArgumentDelta(argumentsByItemId.get(chunk.item_id) || "", chunk.arguments)
+				argumentsByItemId.set(chunk.item_id, normalized.accumulatedArguments)
+				if (normalized.argumentDelta !== undefined) {
+					yield {
+						type: "tool_calls",
+						tool_call: {
+							function: {
+								id: chunk.item_id,
+								name: chunk.name,
+								arguments: normalized.argumentDelta,
+							},
+						},
+					} as const
+				}
 			}
 		}
 
